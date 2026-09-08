@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gmxpy"
+version = "0.1.0"
+description = "An object-oriented Python front-end for GROMACS"
+requires-python = ">=3.10"
+readme = "README.md"
+license = "MIT"
+dependencies = []          # the core runs on the standard library alone
+
+[project.optional-dependencies]
+analysis = ["numpy", "pandas", "matplotlib", "mdtraj", "panedr"]
+full = ["numpy", "pandas", "matplotlib", "mdtraj", "MDAnalysis", "panedr"]
+
+[project.scripts]
+gmxpy = "gmxpy.__main__:main"
+
+[tool.setuptools]
+packages = ["gmxpy"]
