@@ -335,6 +335,27 @@ class Project:
         from .report import project_report
         return project_report(self, path, **kwargs)
 
+    # -- HPC ------------------------------------------------------------
+    def submit(self, scheduler="pbs", run_kwargs=None, array=True,
+               name=None, submit=False, **resources):
+        """Batch scripts for every run -- one array job, or one script each.
+
+            project.submit(scheduler="pbs", ncpus=8, ngpus=1,
+                           modules=["gromacs/2026.3"])
+
+        Returns a list of script paths (or job ids when ``submit=True``);
+        with ``array=True`` a single script and a single id.
+        """
+        from .hpc import write, submit_script
+
+        specs = [sim.job_spec(run_kwargs=run_kwargs, **resources)
+                 for sim in self.runs.values()]
+        path = write(specs, scheduler=scheduler, array=array,
+                     name=name or self.name)
+        if not submit:
+            return path
+        return submit_script(path, scheduler)
+
     def __repr__(self):
         done = sum(1 for sim in self if sim.result.finished)
         return (f"<Project {self.name!r}: {len(self)} runs, {done} finished "

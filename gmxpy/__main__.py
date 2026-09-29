@@ -4,6 +4,7 @@
     python -m gmxpy report  [dir]           one HTML file with everything
     python -m gmxpy info    [dir]           what is in this directory
     python -m gmxpy energy  [dir] TERM      print or plot an energy term
+    python -m gmxpy tui     [dir]           browse all of it in the terminal
 """
 
 from __future__ import annotations
@@ -39,13 +40,23 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog="gmxpy", description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("action",
-                        choices=["check", "report", "info", "energy"])
+                        choices=["check", "report", "info", "energy", "tui"])
     parser.add_argument("path", nargs="?", default=".")
     parser.add_argument("term", nargs="?", help="energy term, for 'energy'")
     parser.add_argument("-n", "--name", help="run name (deffnm) to pick one run")
     parser.add_argument("-o", "--output", help="output file")
     parser.add_argument("--plot", action="store_true", help="write a png")
     args = parser.parse_args(argv)
+
+    if args.action == "tui":
+        from .tui import run_tui
+        try:
+            run_tui(args.path, name=args.name)
+        except ImportError as exc:
+            print(f"the TUI needs extra dependencies ({exc}):\n"
+                  '  pip install "gmxpy[tui]"')
+            return 2
+        return 0
 
     target = _open(args.path, args.name)
 

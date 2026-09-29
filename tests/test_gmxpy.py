@@ -21,6 +21,27 @@ TEST_SYSTEM = Path(os.environ.get("GMXPY_TEST_SYSTEM",
                               "~/abfe-benchmark/parameters/brd4/ligand1")).expanduser()
 
 
+def needs_gmx(func):
+    """Skip an integration test without a test system or a reachable gmx.
+
+    Works both under pytest (shows as a skip, not a failure) and under
+    ``python tests/test_gmxpy.py``.
+    """
+    def wrapper(*args, **kwargs):
+        if not TEST_SYSTEM.exists():
+            print("  (skipped: no test system)")
+            return
+        try:
+            from gmxpy.environment import Environment
+            Environment.detect()
+        except Exception:
+            print("  (skipped: no gmx -- module load gromacs/... first)")
+            return
+        return func(*args, **kwargs)
+    wrapper.__name__ = func.__name__
+    return wrapper
+
+
 def test_units():
     assert (5 * u.angstrom).canonical == 0.5
     assert (0.5 * u.nanometer).value_in("angstrom") == 5
@@ -179,9 +200,264 @@ def test_topology_and_structure():
 
 
 # ---------------------------------------------------------------------
+# new features: hpc / protocol / sampling (unit, no GROMACS)
+# ---------------------------------------------------------------------
+
+def test_job_scripts():
+    from gmxpy.hpc import JobSpec, render, render_array, write
+
+    spec = JobSpec(command="gmx mdrun -deffnm prod", workdir="/runs/prod",
+                   name="prod", ncpus=8, ngpus=1, walltime="12:00:00",
+                   modules=("gromacs/2026.3",), env={"GMXPY_GMX": "/x/gmx"})
+    pbs = render(spec, "pbs")
+    assert "#PBS -N prod" in pbs
+    assert "#PBS -l select=1:ncpus=8:mpiprocs=8:ngpus=1" in pbs
+    assert "#PBS -l walltime=12:00:00" in pbs
+    assert "module load gromacs/2026.3" in pbs
+    assert "cd /runs/prod" in pbs and "gmx mdrun -deffnm prod" in pbs
+
+    torque = render(spec, "torque")
+    assert "#PBS -l nodes=1:ppn=8:gpus=1" in torque
+
+    slurm = render(spec, "slurm")
+    assert "--gres=gpu:1" in slurm and "--cpus-per-task=8" in slurm
+
+    try:
+        render(spec, "lsf")
+    except errors.HpcError:
+        pass
+    else:
+        raise AssertionError("unknown scheduler must raise")
+
+    other = JobSpec(command="gmx mdrun -deffnm md", workdir="/runs/win_01")
+    array = render_array([spec, other], "pbs", name="umb")
+    assert "#PBS -J 0-1" in array
+    assert "/runs/prod" in array and "/runs/win_01" in array
+    assert "${PBS_ARRAY_INDEX:-0}" in array and "DIRS=(" in array
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = write(spec, Path(tmp) / "job.sh", "pbs")
+        assert Path(path).read_text() == pbs
+
+
+def test_pull_mdp():
+    from gmxpy import Pull
+
+    pull = Pull("Protein", "resname LIG", k=1000, init=0.5)
+    keys = pull.mdp_keys()
+    assert keys["pull"] == "yes"
+    assert keys["pull-ngroups"] == 2 and keys["pull-ncoords"] == 1
+    assert keys["pull-group1-name"] == "gmxpy_pull0"
+    assert keys["pull-coord1-groups"] == "1 2"
+    assert keys["pull-coord1-type"] == "umbrella"
+    assert keys["pull-coord1-geometry"] == "distance"
+    assert keys["pull-coord1-k"] == 1000
+    assert keys["pull-coord1-init"] == 0.5
+
+    window = pull.copy(init=0.7)
+    assert window.mdp_keys()["pull-coord1-init"] == 0.7
+    assert pull.mdp_keys()["pull-coord1-init"] == 0.5      # original untouched
+
+    quantity = Pull("a", "b", init=5 * u.angstrom)
+    assert quantity.mdp_keys()["pull-coord1-init"] == 0.5
+
+    vec = Pull("a", "b", geometry="direction", vec=(0, 0, 1)).mdp_keys()
+    assert vec["pull-coord1-vec"] == "0 0 1"
+
+    for bad in (dict(geometry="torsion"), dict(type="spring")):
+        try:
+            Pull("a", "b", **bad)
+        except errors.GmxpyError:
+            pass
+        else:
+            raise AssertionError("bad pull options must raise")
+
+    # merged into an mdp exactly the way Simulation(pull=) does it
+    mdp = MDP.preset("md").update(**keys)
+    assert mdp["pull-coord1-k"] == "1000"
+
+
+def test_demux_parser():
+    from gmxpy import demux
+
+    log = """
+Repl t=1.0 step=500: 0x 1x
+Repl t=2.0 step=1000: 0X 1x
+Repl t=3.0 step=1500: 0x 1X
+Repl count[ 0]=        1
+Repl count[ 1]=        1
+Repl  av. x:          0.333    0.333
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "md.log"
+        path.write_text(log)
+        trace = demux(path)
+        assert trace.times == [1.0, 2.0, 3.0]
+        # directory temperatures: r0/r1 swap at t=2 (pair 0), then at t=3 the
+        # config now in r1 swaps with r2... only 2 pairs, 3 dirs
+        assert trace.temperatures[0] == [0, 1, 2]
+        assert trace.temperatures[1] == [1, 0, 2]
+        assert trace.temperatures[2] == [1, 2, 0]
+        assert trace.exchange_counts == [1, 1]
+        assert trace.exchange_fractions == [0.333, 0.333]
+        try:
+            frame = trace.to_dataframe()
+        except ImportError:                        # pandas is optional
+            pass
+        else:
+            assert frame.shape == (3, 4) and list(frame["r1"]) == [1, 0, 2]
+
+        hot = demux(path, temperatures=[300, 320, 340])
+        assert hot.series(0).y == [300, 320, 320]
+        assert hot.series(2).name == "r2"
+
+        empty = Path(tmp) / "empty.log"
+        empty.write_text("nothing here")
+        try:
+            demux(empty)
+        except errors.AnalysisError:
+            pass
+        else:
+            raise AssertionError("a log without exchanges must raise")
+
+    # the layout GROMACS has written since 2024
+    new_format = """
+Replica exchange at step 50 time 0.10000
+Repl 0 <-> 1  dE_term =  2.556e-01 (kT)
+Repl ex  0    1
+Repl pr   .77
+Replica exchange at step 100 time 0.20000
+Repl ex  0 x  1
+Repl pr   1.0
+Replica exchange at step 150 time 0.30000
+Repl ex  0    1
+Repl pr   .65
+Repl  average number of exchanges:
+Repl     0    1
+Repl      .33
+"""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "md.log"
+        path.write_text(new_format)
+        trace = demux(path, temperatures=[300, 320])
+        assert trace.times == [0.1, 0.2, 0.3]
+        # no swap, swap, no swap: directory 0 ends up running 320 K
+        assert trace.temperatures == [[300, 320], [320, 300], [320, 300]]
+        assert trace.exchange_counts == [1]
+        assert trace.exchange_fractions == [0.33]
+        assert trace.series(0).y == [300, 320, 320]
+
+
+def test_protocol_stage_mdp():
+    from gmxpy import Protocol
+    from gmxpy.protocol import _steps
+
+    assert _steps(100 * u.ps, 0.002) == 50000
+    assert _steps(0.5, 0.002) == 250
+    try:
+        _steps(-1, 0.002)
+    except errors.GmxpyError:
+        pass
+    else:
+        raise AssertionError("a negative duration must raise")
+
+    protocol = Protocol(nvt=100 * u.ps, npt=1 * u.ns, dt=2 * u.femtosecond,
+                        temperature=310)
+    assert protocol.stage_names == ["em", "nvt", "npt"]
+    nvt = protocol.stage_mdp("nvt")
+    assert nvt.nsteps == 50000 and nvt.ref_t == 310
+    assert nvt.gen_vel == "yes"                    # velocities start here
+    npt = protocol.stage_mdp("npt")
+    assert npt.nsteps == 500000 and npt.ref_t == 310 and npt.gen_vel == "no"
+    assert npt.pcoupl.lower() == "c-rescale"
+    assert protocol.stage_mdp("em").nsteps == 50000
+
+    # bare em number is a step count; dict overrides merge, keeping defaults
+    assert Protocol(em=137).stage_mdp("em").nsteps == 137
+    custom = Protocol(em=False, nvt={"gen_seed": 7})
+    assert custom.stage_names == ["nvt", "npt"]
+    seeded = custom.stage_mdp("nvt")
+    assert seeded.gen_seed == 7 and seeded.nsteps == 50000   # 100 ps default
+    assert Protocol(nvt={"nsteps": 50}).stage_mdp("nvt").nsteps == 50
+    assert Protocol(nvt={"duration": 0.06}).stage_mdp("nvt").nsteps == 30
+    # a stage with neither duration nor nsteps cannot be built
+    stripped = Protocol(nvt=100.0)
+    stripped._durations.pop("nvt")
+    try:
+        stripped.stage_mdp("nvt")
+    except errors.GmxpyError as exc:
+        assert "duration" in str(exc)
+    else:
+        raise AssertionError("nvt without nsteps/duration must raise")
+
+
+def test_protocol_posre_detection():
+    from gmxpy.protocol import Equilibration
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "s.gro").write_text("t\n0\n 0.0 0.0 0.0\n")
+        restrained = tmp / "with_posre.top"
+        restrained.write_text('#include "forcefield.itp"\n'
+                              '#ifdef POSRES\n#include "posre.itp"\n#endif\n')
+        free = tmp / "plain.top"
+        free.write_text('#include "forcefield.itp"\n')
+
+        eq = Equilibration(structure=tmp / "s.gro", topology=restrained,
+                           workdir=tmp, env=object())
+        assert eq._posre_block() == "-DPOSRES"
+
+        eq = Equilibration(structure=tmp / "s.gro", topology=free,
+                           workdir=tmp, env=object(), posre="auto")
+        assert eq._posre_block() is None and eq.notes
+
+        try:
+            Equilibration(structure=tmp / "s.gro", topology=free, workdir=tmp,
+                          env=object(), posre=True)._posre_block()
+        except errors.GmxpyError:
+            pass
+        else:
+            raise AssertionError("posre=True without a POSRES block must raise")
+
+
+def test_temperature_ladder():
+    from gmxpy import temperature_ladder
+
+    ladder = temperature_ladder(300, 344.2, 3)
+    assert len(ladder) == 3 and abs(ladder[0] - 300) < 1e-9
+    assert abs(ladder[1] ** 2 - 300 * 344.2) < 1.0       # geometric middle
+    assert ladder == sorted(ladder)
+    try:
+        temperature_ladder(300, 300, 3)
+    except errors.GmxpyError:
+        pass
+    else:
+        raise AssertionError("a flat ladder must raise")
+
+
+def test_wham_inputs():
+    from gmxpy.sampling import _wham_inputs
+    from gmxpy import Umbrella, Pull
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tprs = [Path(tmp) / f"w{i}.tpr" for i in range(3)]
+        found, pullfs, base = _wham_inputs(tprs)
+        assert found == tprs and pullfs is None and base == tprs[0].parent
+
+        umb = Umbrella(Pull("a", "b"), [0.4, 0.5], workdir=tmp, env=object())
+        try:
+            _wham_inputs(umb)
+        except errors.GmxpyError:
+            pass
+        else:
+            raise AssertionError("unbuilt windows must raise")
+
+
+# ---------------------------------------------------------------------
 # integration -- needs a working gmx and the test system
 # ---------------------------------------------------------------------
 
+@needs_gmx
 def test_integration():
     from gmxpy import Simulation
 
@@ -287,6 +563,7 @@ def test_integration():
         assert "not available" not in report.read_text()
 
 
+@needs_gmx
 def test_preparation():
     """PDB -> force field -> box -> water -> ions -> minimised."""
     from gmxpy import System
@@ -325,6 +602,7 @@ def test_preparation():
         assert result.simulation_time is None      # steps are not picoseconds
 
 
+@needs_gmx
 def test_project():
     """Several trajectories at once: fan-out, mean +/- sd, concatenation."""
     from gmxpy import Project, Simulation
@@ -366,6 +644,7 @@ def test_project():
         assert report.exists() and "not available" not in report.read_text()
 
 
+@needs_gmx
 def test_analysis_cache():
     """A repeated question must not re-read the trajectory."""
     from gmxpy import Simulation
@@ -405,6 +684,7 @@ def test_analysis_cache():
         assert cached.stat().st_mtime_ns > stamp
 
 
+@needs_gmx
 def test_checks_and_cli():
     """sim.check() and the command line, on a run that is deliberately young."""
     from gmxpy import Simulation
@@ -443,6 +723,7 @@ def test_checks_and_cli():
         assert (Path(tmp) / "r.html").exists()
 
 
+@needs_gmx
 def test_analysis_engines():
     """The in-memory backend must agree with gmx on what it replaces."""
     from gmxpy import Simulation
@@ -493,6 +774,7 @@ def test_analysis_engines():
         assert auto.msd(sim.select.water).diffusion_error is not None
 
 
+@needs_gmx
 def test_free_energy():
     """A short decoupling, then BAR."""
     from gmxpy import Simulation, bar
@@ -524,16 +806,300 @@ def test_free_energy():
         assert len(result.profile) == 2
 
 
+@needs_gmx
+def test_equilibrate():
+    """The em -> nvt -> npt chain, and the handover to production."""
+    from gmxpy import Equilibration, MDP
+    from gmxpy.simulation import Simulation
+
+    if not TEST_SYSTEM.exists():
+        print("  (skipped: no test system)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        chain = Equilibration(
+            structure=TEST_SYSTEM / "complex.gro",
+            topology=TEST_SYSTEM / "complex.top",
+            workdir=tmp,
+            protocol=None,
+            em=100, nvt=0.06 * u.picosecond, npt=0.06 * u.picosecond,
+            dt=0.002)
+        chain.run(run_kwargs=dict(ntomp=8))
+        assert chain.ok and list(chain.stages) == ["em", "nvt", "npt"]
+        # amber-style topology: no POSRES block, so it says so and runs free
+        assert chain.notes and "POSRES" in chain.notes[0]
+
+        # nvt produced velocities; npt ran from its checkpoint
+        assert chain.stages["nvt"].result.finished
+        assert chain.stages["npt"].checkpoint.exists
+
+        checks = chain.check()
+        assert set(checks) == {"em", "nvt", "npt"}
+
+        prod = chain.production(
+            MDP.preset("md", nsteps=50, nstenergy=10, nstlog=50,
+                       nstxout_compressed=50), name="prod")
+        assert (Path(tmp) / "prod.tpr").exists()
+        prod.run(ntomp=8)
+        assert prod.result.finished
+
+        try:            # this topology cannot do restrained production
+            chain.production(name="prod2", posre=True)
+        except errors.GmxpyError:
+            pass
+        else:
+            raise AssertionError("posre=True without a POSRES block must raise")
+
+        # a finished chain is skipped on rerun
+        assert chain.run() and all(sim.log.finished for sim in chain.stages.values())
+
+        # the standalone path also works
+        direct = Equilibration(structure=TEST_SYSTEM / "complex.gro",
+                               topology=TEST_SYSTEM / "complex.top",
+                               workdir=Path(tmp) / "direct2", em=50,
+                               nvt={"nsteps": 20}, npt={"nsteps": 20})
+        direct.run(run_kwargs=dict(ntomp=8))
+        assert direct.ok
+
+
+@needs_gmx
+def test_pull_and_wham():
+    """Pull code, umbrella windows, and a (tiny) WHAM roundtrip."""
+    from gmxpy import MDP, Pull, Simulation, Umbrella, wham
+    from gmxpy.selection import SelectionContext, Selector
+
+    if not TEST_SYSTEM.exists():
+        print("  (skipped: no test system)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        context = SelectionContext(TEST_SYSTEM / "complex.gro", workdir=tmp)
+        sel = Selector(context)
+        pull = Pull(sel.group("Protein"), sel.resname("LIG"),
+                    type="umbrella", k=1000)
+
+        mdp = MDP.preset("md", nsteps=100, nstenergy=10, nstlog=100,
+                         nstxout_compressed=0, gen_vel="yes", gen_temp=300,
+                         gen_seed=1, continuation="no")
+        sim = Simulation(structure=TEST_SYSTEM / "complex.gro",
+                         topology=TEST_SYSTEM / "complex.top", mdp=mdp,
+                         pull=pull, name="steer", workdir=tmp / "steer")
+        sim.prepare(maxwarn=1)
+        assert "pull-group1-name" in (tmp / "steer" / "steer.mdp").read_text()
+        sim.run(ntomp=8)
+        assert (tmp / "steer" / "steer_pullf.xvg").exists()
+        assert (tmp / "steer" / "steer_pullx.xvg").exists()
+
+        # windows: same start, different reference distances
+        base = MDP.preset("md", nsteps=100, nstenergy=10, nstlog=100,
+                          nstxout_compressed=0, gen_vel="yes", gen_temp=300,
+                          gen_seed=1, continuation="no")
+        umb = Umbrella(pull, values=[0.40, 0.48, 0.56], structure=TEST_SYSTEM
+                       / "complex.gro", topology=TEST_SYSTEM / "complex.top",
+                       mdp=base, workdir=tmp / "umb")
+        windows = umb.build()
+        assert len(windows) == 3
+        assert (tmp / "umb" / "win_01").exists()
+        assert umb.windows[1].pull.mdp_keys()["pull-coord1-init"] == 0.48
+        umb.prepare(maxwarn=1)
+        for window in windows:
+            window.run(ntomp=8)
+            assert window.result.finished
+            assert (window.workdir / "md_pullf.xvg").exists()
+
+        pmf = wham(umb, temperature=300, begin=0.0)
+        assert len(pmf) > 10 and pmf.name == "PMF"
+        assert len(pmf.histogram) == len(pmf)
+        pmf.plot().save(tmp / "pmf.png")
+
+        # as a project: array submission script
+        project = umb.project()
+        script = project.submit(scheduler="pbs", array=True, ncpus=8,
+                                modules=("gromacs/2026.3",))
+        text = script.read_text()
+        assert "#PBS -J 0-2" in text and "win_02" in text
+
+
+@needs_gmx
+def test_remd():
+    """Two-temperature REMD via mdrun -multidir, plus demux."""
+    from gmxpy import MDP, Simulation, TemperatureREMD, demux
+
+    if not TEST_SYSTEM.exists():
+        print("  (skipped: no test system)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        mdp = MDP.preset("md", nsteps=100, nstenergy=10, nstlog=10,
+                         nstxout_compressed=0, gen_vel="yes",
+                         gen_seed=1, continuation="no")
+        remd = TemperatureREMD(mdp, [300, 320],
+                               structure=TEST_SYSTEM / "complex.gro",
+                               topology=TEST_SYSTEM / "complex.top",
+                               workdir=tmp)
+        assert remd.temperatures == [300.0, 320.0]
+        line = remd.command(replex=25)
+        assert "mdrun" in line and "-multidir" in line and "-replex 25" in line
+        remd.prepare(maxwarn=1)
+        remd.run(replex=25, ntomp=4)
+        assert all(sim.result.finished for sim in remd.sims)
+
+        trace = demux(*[sim.paths["log"] for sim in remd.sims],
+                      temperatures=remd.temperatures)
+        assert trace.n_replicas == 2 and len(trace.times) >= 2
+        assert all(row[0] in (300.0, 320.0) for row in trace.temperatures)
+
+
+@needs_gmx
+def test_submit_script():
+    """Job scripts from a real simulation (no actual submission)."""
+    from gmxpy import MDP, Simulation
+
+    if not TEST_SYSTEM.exists():
+        print("  (skipped: no test system)")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        sim = Simulation(structure=TEST_SYSTEM / "complex.gro",
+                         topology=TEST_SYSTEM / "complex.top",
+                         mdp=MDP.preset("md", nsteps=100), name="prod",
+                         workdir=tmp)
+        script = sim.submit(scheduler="pbs", ncpus=8, ngpus=1,
+                            walltime="4:00:00",
+                            modules=("gromacs/2026.3",),
+                            run_kwargs=dict(nb="gpu"))
+        text = Path(script).read_text()
+        assert "#PBS -l select=1:ncpus=8:mpiprocs=8:ngpus=1" in text
+        assert "-deffnm" in text and "-nb gpu" in text
+        assert "module load gromacs/2026.3" in text
+
+        torque = sim.submit(scheduler="torque", ncpus=4, output=Path(tmp) / "t.sh")
+        assert "#PBS -l nodes=1:ppn=4" in Path(torque).read_text()
+
+
+def test_tui():
+    """The TUI, headless: render helpers plus a bootstrap over a fake run.
+
+    Needs textual (pip install "gmxpy[tui]"); skips without it.  No GROMACS:
+    a fake Environment stands in for the real detection, and the run has a
+    log but no edr, so the energy tab exercises its error path.
+    """
+    try:
+        import textual
+    except ImportError:
+        print("  (skipped: no textual)")
+        return
+
+    from gmxpy.tui import render
+
+    # -- render helpers, no app needed ------------------------------------
+    x = [i * 0.5 for i in range(40)]
+    y = [300.0 + 5.0 * ((i * 2654435761) % 97) / 97 for i in range(40)]
+    series = Series(x, y, name="Temperature", xlabel="Time (ps)",
+                    ylabel="Temperature (K)")
+    stats = render.stats_markup(series)
+    assert "Temperature" in stats and "n=40" in stats
+    assert render.plot_png(object()) is None          # not plottable
+    other = Series(x, [v - 20.0 for v in y], name="Potential",
+                   xlabel="Time (ps)", ylabel="Potential (kJ/mol)")
+    try:
+        import matplotlib  # noqa: F401
+    except ImportError:
+        print("  (partly skipped: no matplotlib)")
+    else:
+        png = render.plot_png(series)
+        assert png[:8] == b"\x89PNG\r\n\x1a\n"
+        assert render.plot_png([series, other])[:8] == b"\x89PNG\r\n\x1a\n"
+        try:
+            from textual_image.widget import Image  # noqa: F401
+        except ImportError:
+            pass
+        else:
+            assert render.image_widget(png) is not None
+
+    # -- the app, headless --------------------------------------------------
+    import asyncio
+
+    from gmxpy.environment import Environment
+
+    fake_env = Environment(executable="/bin/true", version="test",
+                           source="test-env")
+    with tempfile.TemporaryDirectory() as tmp:
+        runs = Path(tmp) / "runs"
+        runs.mkdir()
+        (runs / "demo.tpr").write_bytes(b"")
+        (runs / "demo.log").write_text("Finished mdrun on rank 0.\n")
+
+        async def scenario():
+            from gmxpy.tui.app import GmxpyTUI
+            app = GmxpyTUI(runs, env=fake_env)
+            async with app.run_test(size=(120, 40)) as pilot:
+                for _ in range(100):
+                    if app._opened:
+                        break
+                    await asyncio.sleep(0.05)
+                assert app._opened
+                assert app.sim is not None and app.sim.name == "demo"
+                await pilot.pause()
+
+                from textual.widgets import DataTable, RichLog
+                assert len(app.query_one("#log", RichLog).lines) >= 1
+                for _ in range(100):
+                    if app.query("#summary-table"):
+                        break
+                    await asyncio.sleep(0.05)
+                table = app.query_one("#summary-table", DataTable)
+                assert table.row_count == 1
+                # a run with a log but no edr: the check tab shows the FAIL
+                for _ in range(100):
+                    if app.query_one("#check-body").children:
+                        break
+                    await asyncio.sleep(0.05)
+                assert len(app.query_one("#check-body").children) >= 2
+
+                # the plot body: sparkline fallback, or a real image when
+                # matplotlib and textual-image are installed
+                try:
+                    import matplotlib  # noqa: F401
+                    import textual_image.widget  # noqa: F401
+                except ImportError:
+                    app._show_plot("#energy-body", series, None,
+                                   render.stats_markup(series), "#energy-stats")
+                    from textual.widgets import Sparkline
+                    assert any(isinstance(w, Sparkline) for w in
+                               app.query_one("#energy-body").children)
+                else:
+                    app._show_plot("#energy-body", series, render.plot_png(series),
+                                   render.stats_markup(series), "#energy-stats")
+                    assert app.query_one("#energy-body").children
+
+        async def scenario_empty():
+            from gmxpy.tui.app import GmxpyTUI
+            app = GmxpyTUI(Path(tmp) / "nowhere", env=fake_env)
+            async with app.run_test(size=(100, 30)) as pilot:
+                for _ in range(100):
+                    if app._opened:
+                        break
+                    await asyncio.sleep(0.05)
+                assert app._opened and app._target is None
+                await pilot.pause()
+
+        asyncio.run(scenario())
+        asyncio.run(scenario_empty())
+
+
 def main():
     slow = ("test_integration", "test_preparation", "test_project",
             "test_analysis_cache", "test_checks_and_cli",
-            "test_analysis_engines", "test_free_energy")
+            "test_analysis_engines", "test_free_energy",
+            "test_equilibrate", "test_pull_and_wham", "test_remd",
+            "test_submit_script")
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and k not in slow]
     if "--integration" in sys.argv:
         tests += [test_integration, test_preparation, test_project,
                   test_analysis_cache, test_checks_and_cli,
-                  test_analysis_engines, test_free_energy]
+                  test_analysis_engines, test_free_energy,
+                  test_equilibrate, test_pull_and_wham, test_remd,
+                  test_submit_script]
     failed = 0
     for test in tests:
         try:

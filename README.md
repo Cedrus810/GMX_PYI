@@ -44,10 +44,35 @@ gmxpy energy runs/ Temperature --plot
 [ok  ] periodic images: closest image 2.357 nm, twice the cut-off is 2 nm
 ```
 
+## The TUI
+
+```bash
+pip install -e ".[tui]"
+gmxpy tui runs/              # -n prod picks one run
+```
+
+The same library calls the CLI makes, in a terminal interface: the runs
+under a directory in a sidebar, and Summary, Check, Energy, Analysis and
+Report tabs.  `q` quits, `r` refreshes.  Energy terms come from the
+`.edr` header (panedr when installed), Check is `sim.check()` with the
+verdicts colour-coded, Analysis offers the common methods with preset or
+free-text selections -- for one run, or across every run of a project
+(mean +/- sd) -- and Report writes the same self-contained HTML file as
+`gmxpy report`.
+
+Plots are real images: matplotlib draws them and
+[textual-image](https://pypi.org/project/textual-image/) displays them
+through the Kitty graphics protocol or Sixel, falling back to unicode
+half-cells on terminals with neither.  kitty, WezTerm, iTerm2, Windows
+Terminal 1.22+, foot and recent Konsole/VTE terminals can show them; over
+plain SSH the pictures travel with the stream.  tmux needs graphics
+passthrough configured, and textual-image needs Python >= 3.12 -- without
+either, the TUI still works and the plots fall back to sparklines.
+
 ## Install
 
 ```bash
-git clone https://github.com/<you>/gmxpy && cd gmxpy
+git clone https://github.com/Cedrus810/GMX_PYI && cd GMX_PYI
 pip install -e ".[analysis]"        # brings the `gmxpy` command
 ```
 
@@ -59,8 +84,8 @@ trajectory engine -- each is imported only where it is used.
 `gmx` is taken from explicit sources only, in this order: `executable=`,
 `$GMXPY_GMX`, `$GMXBIN`/`$GROMACS_DIR`, `$PATH`, `/usr/local/gromacs*`.
 It never globs home directories -- on a shared machine that finds somebody
-else's build.  `module load gromacs2026.3` sets `$GMXBIN` and `$PATH`, so
-that is enough; otherwise name it once:
+else's build.  `module load gromacs/2026.3` puts `gmx` on `$PATH`, so that
+is enough; otherwise name it once:
 
 ```bash
 export GMXPY_GMX=/opt/gromacs-2026.3/bin/gmx    # absolute: $HOME differs per node on NFS
@@ -97,11 +122,15 @@ GROMACS 2026.3 (mixed, AVX2_256, GPU: CUDA) at /opt/gromacs-2026.3/bin/gmx [from
 | `fast.py` | in-memory analysis backend (mdtraj + numpy), GROMACS' definitions |
 | `quality.py` | `sim.check()`: thermostat, drift, constraints, box size |
 | `__main__.py` | the `gmxpy` command |
+| `tui/` | the `gmxpy tui` command: browse runs, checks and plots in the terminal |
 | `analysis.py` | rmsd, rmsf, Rg, distance, rdf, msd, hbonds, sasa, mindist, periodic-image, dssp, angle/dihedral, density, cluster, pca, BAR, free-energy landscape |
 | `system.py` | `System.from_pdb(...)`: pdb2gmx -> box -> solvate -> add_ions -> minimise |
 | `plotting.py` | `result.plot()`, `.save()` |
 | `simulation.py` | `Simulation`, `Result`, prepare / run / extend / resume / merge_parts |
 | `project.py` | `Project`: many runs at once, fan-out analysis, mean +/- sd |
+| `protocol.py` | `system.equilibrate()`: the em -> nvt -> npt chain in one call |
+| `sampling.py` | `Pull`, `Umbrella` + `wham`, `TemperatureREMD` + `demux` |
+| `hpc.py` | `sim.submit()` / `project.submit()`: PBS/Torque/Slurm job scripts |
 | `report.py` | `sim.report()` -> one self-contained HTML file |
 
 ## What it covers
@@ -135,6 +164,72 @@ landscape(x, y)          # -kT ln P(x, y)
 # output
 series.plot() / .save() / .to_dataframe() / .to_csv()
 sim.report()
+
+# equilibration / clusters / enhanced sampling
+system.equilibrate(nvt=100 * u.ps, npt=1 * u.ns) .production(...)
+sim.submit(scheduler="pbs", ncpus=8, ngpus=1); project.submit(array=True)
+Simulation(..., pull=Pull(a, b, k=1000))     # umbrella / steered pulling
+Umbrella(pull, values) -> wham() -> PMF      # umbrella + WHAM
+TemperatureREMD(mdp, ladder) -> demux()      # T-REMD + exchange trace
+```
+
+## Equilibration in one call
+
+```python
+eq = system.equilibrate(workdir="eq", nvt=100 * u.ps, npt=1 * u.ns)
+eq.ok, eq.check()                       # every stage finished, and well
+prod = eq.production(MDP.preset("md", nsteps=5_000_000), name="prod")
+prod.run(ntomp=8)
+```
+
+The chain hands each stage's output structure to the next and passes the
+checkpoint to grompp (`-t`), so velocities survive.  nvt/npt are restrained
+(`-DPOSRES` + `-r`) when the topology has a POSRES block -- pdb2gmx writes
+one; an Amber-style topology just gets a note and runs free.  Finished
+stages are skipped, so an interrupted chain is resumed by the same call.
+`Protocol(em=False, nvt={"gen_seed": 7})` customises; durations become
+nsteps via `dt`.
+
+## Clusters
+
+```python
+script = sim.submit(scheduler="pbs", ncpus=8, ngpus=1, walltime="24:00:00",
+                    modules=("gromacs/2026.3",), run_kwargs=dict(nb="gpu"))
+script = project.submit(scheduler="pbs", ncpus=8, array=True)   # one array job
+```
+
+The mdrun line is the one `sim.command()` prints; `submit=True` hands the
+script to `qsub`/`sbatch` and returns the job id, `submit=False` (default)
+just writes it.  `pbs` (PBS Pro `select=` syntax), `torque` and `slurm`
+templates are built in; a `Project` becomes one array job running a
+directory per index -- the shape umbrella windows and replicas want.
+
+## Enhanced sampling
+
+```python
+# a pull coordinate: selections in, mdp keys + index groups out
+pull = Pull(sim.select.protein, sim.select.ligand, k=1000)      # kJ/mol/nm^2
+sim = Simulation(structure=..., topology=..., mdp=mdp, pull=pull, name="md")
+sim.prepare()                  # pull-* keys merged, groups written to an ndx
+sim.run()                      # -> md_pullx.xvg / md_pullf.xvg
+
+# umbrella windows along it, then WHAM
+umb = Umbrella(pull, values=np.arange(0.4, 1.21, 0.05), k=1000,
+               structure=..., topology=..., mdp=MDP.preset("md"), workdir="umb")
+umb.from_trajectory(traj)      # start each window from the nearest frame
+umb.prepare()
+umb.project().submit(array=True)        # one PBS array job for all windows
+pmf = wham(umb, temperature=300, bootstrap=100)
+pmf.plot()
+
+# temperature REMD
+remd = TemperatureREMD(mdp, temperature_ladder(300, 340, 8),
+                       structure=..., topology=..., workdir="remd")
+remd.prepare(); remd.run(replex=100)    # one mdrun -multidir for every replica
+trace = remd.demux()                    # which T each directory ran, when
+trace.exchange_fractions                # per neighbour pair
+
+sim.run(plumed="plumed.dat")            # validated: file + build support
 ```
 
 Many trajectories -- replicas, restarts, windows:
@@ -189,7 +284,7 @@ Two analyses deliberately stay on gmx even on `engine="auto"`:
 - `msd`: the two fit the diffusion constant over different windows and
   disagree by ~15%, and D is a number people quote.
 
-## Equilibration
+## Burn-in detection
 
 ```python
 >>> density = sim.energy["Density"]
@@ -246,6 +341,23 @@ since they produce no file. Turn both off with `Analysis(sim, cache=False)`.
 - `trjcat` drops duplicate-time frames, which is right for continuation
   chunks and silently wrong for replicas -- `concatenate(mode="append")`
   keeps them all.
+- Energy minimisation writes no checkpoint, so the equilibration chain only
+  hands a `-t` file to grompp when the previous stage actually produced one.
+- Handing grompp any `-n` file hides its built-in index groups, and an mdp
+  saying `tc-grps = System` then fails; a pull run therefore starts from a
+  `make_ndx` default-groups file (cached in `.gmxpy/`) with the pull groups
+  appended.
+- A pull group larger than half the box needs `pull-groupX-pbcatom`; `Pull`
+  picks each group's centre-nearest atom itself and sets
+  `pull-pbc-ref-prev-step-com = yes` to match.
+- mdrun names pull output `<name>_pullf.xvg` / `<name>_pullx.xvg` --
+  an underscore, unlike every other `-deffnm` output.
+- `mdrun -multidir` refuses to run on a thread-MPI build; when a `gmx_mpi`
+  sits next to the detected `gmx`, `TemperatureREMD` runs it under
+  `mpirun -np <replicas>`.
+- GROMACS 2024+ writes replica exchanges as `Replica exchange at step`
+  blocks where `Repl ex  0 x  1` marks an accepted swap (the `x` between
+  the labels), not the old `Repl t=` lines; `demux()` reads both layouts.
 
 **Paths.** Every path handed to gmx is made absolute (`~` expanded, `..`
 normalised, symlinks *not* resolved so automounted NFS paths survive).
@@ -265,7 +377,10 @@ paths -- `$HOME` is not the same directory on every machine.
 
 ```bash
 python tests/test_gmxpy.py                 # unit, no GROMACS
-python tests/test_gmxpy.py --integration    # + real grompp/mdrun/analysis
+python tests/test_gmxpy.py --integration   # + real grompp/mdrun/analysis
+# or, under pytest:
+pytest tests/test_gmxpy.py -k "not integration"        # unit only
+pytest tests/test_gmxpy.py::test_remd                   # pick any test
 python examples/brd4_demo.py /tmp/demo      # prepare -> run -> analyse -> report
 ```
 
@@ -273,13 +388,23 @@ The integration tests and the demo need a prepared system (`.gro` + `.top`);
 point them at one with `GMXPY_TEST_SYSTEM`. The numbers quoted here come from
 a BRD4 + ligand box, 39 689 atoms (protein + ligand + water + ions).
 
+The newer suites, all run against GROMACS 2026.3 (thread-MPI + CUDA) with
+`module load gromacs/2026.3`:
+
+- `test_equilibrate` -- the full em -> nvt -> npt chain and the handover to
+  production, on a topology without a POSRES block (the restrained path is
+  exercised by the pdb2gmx-based tests).
+- `test_pull_and_wham` -- a pull run, three umbrella windows, a real
+  `gmx wham` roundtrip, and the PBS array script for the windows.
+- `test_remd` -- two replicas via `mpirun gmx_mpi -multidir`, then `demux()`
+  on the new-format logs.
+- `test_submit_script` -- PBS/Torque script text from a live simulation.
+
 ## Not built yet
 
-- HPC submission -- `sim.command()` already prints the mdrun line for a
-  job script; there is no scheduler executor.
 - `gmxapi` backend; the CLI backend is the only one.
-- Membrane-specific analyses (`gmx order`, `densmap`), replica exchange,
-  AWH, and the GPCR/plugin selectors.
+- Membrane-specific analyses (`gmx order`, `densmap`), AWH, and the
+  GPCR/plugin selectors.
 
 ## License
 

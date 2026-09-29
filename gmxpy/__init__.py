@@ -21,22 +21,30 @@ from .command import GromacsCommand, gmx
 from .data import Checkpoint, Energy, LogFile, Series, Trajectory
 from .environment import Environment
 from .errors import (AnalysisError, CheckpointError, GmxpyError, GromacsError,
-                     GromacsNotFound, GromppError, LincsError, MdpError,
-                     MdrunError, SelectionError, TopologyError)
+                     GromacsNotFound, GromppError, HpcError, LincsError,
+                     MdpError, MdrunError, SelectionError, TopologyError)
+from .hpc import JobSpec, render, render_array
 from .mdp import MDP
 from .plotting import plot
+from .protocol import Equilibration, Protocol
 from .quality import CheckReport, check
+from .sampling import (Pull, ReplTrace, TemperatureREMD, Umbrella, demux,
+                       temperature_ladder, wham)
 from .selection import Selection, SelectionContext, Selector
 from .project import Project, SeriesGroup
 from .simulation import Result, Simulation
 from .system import System
 from .topology import Structure, Topology
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "Simulation", "Result", "System", "Project", "SeriesGroup",
     "MDP", "Topology", "Structure",
+    "Protocol", "Equilibration",
+    "Pull", "Umbrella", "wham", "TemperatureREMD", "temperature_ladder",
+    "demux", "ReplTrace",
+    "JobSpec", "render", "render_array",
     "Energy", "Trajectory", "LogFile", "Checkpoint", "Series",
     "Selection", "Selector", "SelectionContext", "Analysis",
     "bar", "landscape",
@@ -44,6 +52,6 @@ __all__ = [
     "check", "CheckReport",
     "GmxpyError", "GromacsError", "GromacsNotFound", "GromppError",
     "MdrunError", "LincsError", "CheckpointError", "TopologyError",
-    "SelectionError", "AnalysisError", "MdpError",
+    "SelectionError", "AnalysisError", "MdpError", "HpcError",
     "__version__",
 ]

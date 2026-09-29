@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "gmxpy"
-version = "0.1.0"
+version = "0.2.0"
 description = "An object-oriented Python front-end for GROMACS"
 requires-python = ">=3.10"
 readme = "README.md"
@@ -14,9 +14,13 @@ dependencies = []          # the core runs on the standard library alone
 [project.optional-dependencies]
 analysis = ["numpy", "pandas", "matplotlib", "mdtraj", "panedr"]
 full = ["numpy", "pandas", "matplotlib", "mdtraj", "MDAnalysis", "panedr"]
+# Python < 3.12 has no textual-image: the TUI still runs, plots fall back
+# to sparklines instead of terminal images.
+tui = ["textual>=1.0", "textual-image[textual]>=0.14; python_version>='3.12'",
+       "matplotlib", "pillow"]
 
 [project.scripts]
 gmxpy = "gmxpy.__main__:main"
 
 [tool.setuptools]
-packages = ["gmxpy"]
+packages = ["gmxpy", "gmxpy.tui"]

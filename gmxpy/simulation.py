@@ -14,7 +14,7 @@ from .command import abspath
 from .analysis import Analysis
 from .data import Checkpoint, Energy, LogFile, Trajectory
 from .environment import Environment
-from .errors import CheckpointError, GmxpyError, MdrunError
+from .errors import CheckpointError, GmxpyError, HpcError, MdrunError
 from .mdp import MDP
 from .selection import SelectionContext, Selector
 from .topology import Structure, Topology
@@ -133,7 +133,7 @@ class Simulation:
     """A GROMACS simulation as a Python object."""
 
     def __init__(self, structure=None, topology=None, mdp=None, name="sim",
-                 workdir=".", tpr=None, index=None, env=None):
+                 workdir=".", tpr=None, index=None, env=None, pull=None):
         self.name = name
         self.workdir = abspath(workdir)
         self.workdir.mkdir(parents=True, exist_ok=True)
@@ -147,6 +147,7 @@ class Simulation:
         self._context = None
         self._frames = None
         self._analysis = None
+        self.pull = pull
         self.result = Result(self)
 
     # -- construction --------------------------------------------------
@@ -197,21 +198,35 @@ class Simulation:
         if not (self._structure and self._topology):
             raise GmxpyError("prepare() needs structure= and topology=")
         mdp_path = self.paths["mdp"]
+        index = self.index
         if isinstance(self.mdp, MDP):
-            problems = self.mdp.validate()
-            if problems:
-                print("MDP warnings:\n  " + "\n  ".join(problems))
-            self.mdp.write(mdp_path)
+            mdp_obj = self.mdp
         elif self.mdp is not None:
-            mdp_path = abspath(self.mdp)
+            mdp_obj = MDP.read(abspath(self.mdp))
         else:
             raise GmxpyError("prepare() needs mdp=")
+        if self.pull is not None:
+            # one index file: the pull groups on top of the defaults (or the
+            # user's groups) -- grompp -n hides its built-in groups entirely.
+            # ndx first: writing it also picks each group's pbcatom, which
+            # mdp_keys() then merges into the mdp.
+            index = self.pull.write_ndx(
+                self.workdir / ".gmxpy" / "pull.ndx",
+                user_index=index or self.context.default_ndx(),
+                context=self.context)
+            mdp_obj.update(**self.pull.mdp_keys())
+        if self.mdp is not None and not isinstance(self.mdp, MDP):
+            mdp_obj.write(mdp_path)      # read from disk: write the merged copy
+        problems = mdp_obj.validate()
+        if problems:
+            print("MDP warnings:\n  " + "\n  ".join(problems))
+        mdp_obj.write(mdp_path)
 
         cmd.Grompp(
             env=self.env, mdp=str(mdp_path), structure=str(self._structure),
             topology=str(self._topology), output=str(tpr),
             mdout=str(self.workdir / f"{self.name}_mdout.mdp"),
-            index=str(self.index) if self.index else None,
+            index=str(index) if index else None,
             restraint=str(abspath(restraint)) if restraint else None,
             checkpoint=str(abspath(checkpoint)) if checkpoint else None,
             maxwarn=maxwarn or None, **kwargs
@@ -238,12 +253,23 @@ class Simulation:
 
     def run(self, ntomp=None, ntmpi=None, nb=None, pme=None, bonded=None,
             update=None, gpu_id=None, nsteps=None, maxh=None, resume=False,
-            append=None, check=True, echo=False, **extra):
-        """Run mdrun.  Returns :class:`Result`."""
+            append=None, check=True, echo=False, plumed=None, **extra):
+        """Run mdrun.  Returns :class:`Result`.
+
+        ``plumed`` is the PLUMED input file for a patched build.
+        """
         if not self.tpr.exists():
             self.prepare()
         if resume:
             self._check_restart()
+        if plumed is not None:
+            plumed = abspath(plumed)
+            if not Path(plumed).exists():
+                raise GmxpyError(f"no PLUMED input file at {plumed}")
+            if not self.env.has("plumed"):
+                raise GmxpyError(
+                    "this GROMACS build has no PLUMED support "
+                    f"({self.env})")
         if ntomp is not None and ntmpi is None and self.env.has("gpu"):
             # a GPU build refuses -ntomp without -ntmpi; one rank is what
             # "give me N threads on this node" means anyway
@@ -251,7 +277,7 @@ class Simulation:
         runner = self._mdrun(
             resume=resume, append=append, ntomp=ntomp, ntmpi=ntmpi, nb=nb,
             pme=pme, bonded=bonded, update=update, gpu_id=gpu_id,
-            nsteps=nsteps, maxh=maxh, **extra)
+            nsteps=nsteps, maxh=maxh, plumed=plumed, **extra)
         proc = runner.run(cwd=self.workdir, check=check, echo=echo)
         self.result = Result(self, proc.returncode)
         if check and not self.result.finished:
@@ -264,6 +290,38 @@ class Simulation:
     def resume(self, **kwargs):
         """Continue from ``<name>.cpt``."""
         return self.run(resume=True, **kwargs)
+
+    # -- HPC ------------------------------------------------------------
+    def job_spec(self, scheduler="pbs", run_kwargs=None, **resources):
+        """The :class:`~gmxpy.hpc.JobSpec` this run would be submitted as."""
+        from .hpc import JobSpec
+
+        kwargs = dict(run_kwargs or {})
+        ncpus = resources.get("ncpus")
+        if ncpus and "ntomp" not in kwargs:
+            kwargs["ntomp"] = ncpus       # one thread per requested core
+        return JobSpec(
+            command=self.command(**{k: v for k, v in kwargs.items()
+                                    if v is not None}),
+            workdir=str(self.workdir), name=self.name, **resources)
+
+    def submit(self, scheduler="pbs", run_kwargs=None, submit=False,
+               output=None, **resources):
+        """Write a batch script for this run (and optionally hand it over).
+
+            script = sim.submit(scheduler="pbs", ncpus=8, ngpus=1,
+                                walltime="24:00:00",
+                                modules=["gromacs/2026.3"],
+                                run_kwargs=dict(nb="gpu"))
+
+        Returns the script path, or the job id when ``submit=True``.
+        """
+        from .hpc import write, submit_script
+
+        spec = self.job_spec(scheduler=scheduler, run_kwargs=run_kwargs,
+                             **resources)
+        path = write(spec, path=output, scheduler=scheduler)
+        return submit_script(path, scheduler) if submit else path
 
     def _check_restart(self):
         """Restarts silently doing the wrong thing is the classic footgun."""

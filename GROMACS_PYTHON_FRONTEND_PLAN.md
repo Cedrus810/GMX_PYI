@@ -1,5 +1,14 @@
 # GROMACS Python Front-End：项目设计与实施计划
 
+> **实施状态(2026-09-29,v0.2.0)。** 本文档是设计期的计划,API 以
+> [README](README.md) 为准。当前进度:P0、P1、P2 全部实现;P3 中
+> enhanced sampling 已实现(`Pull`/`Umbrella` + `wham`、`TemperatureREMD`
+> + `demux`,见 §31 优先级),GPCR selection、ABFE/RBFE、ML/MM、QM/MM
+> 未做。计划之外新增:Textual TUI(`gmxpy tui`)、内存态分析后端
+> (`fast.py`,mdtraj + numpy)、`sim.check()` 运行质量检查(`quality.py`)、
+> 一键平衡链(`protocol.py`)。本机与集群均按 §19 走版本探测,
+> `module load gromacs/2026.3` 即可。
+
 ## 1. 项目定位
 
 目标不是重写 GROMACS，也不是再做一个 Snakemake / Nextflow 风格的 workflow engine。

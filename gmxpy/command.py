@@ -264,6 +264,14 @@ class Bar(GromacsCommand):
              "end": "-e"}
 
 
+class Wham(GromacsCommand):
+    name = "wham"
+    flags = {"tprs": "-it", "positions": "-ix", "pullfs": "-if",
+             "output": "-o", "histogram": "-hist", "bootstrap": "-bsres",
+             "temperature": "-temp", "bins": "-bins", "begin": "-b",
+             "end": "-e", "n_bootstrap": "-nBootstrap"}
+
+
 class Trjconv(GromacsCommand):
     name = "trjconv"
     flags = {"tpr": "-s", "trajectory": "-f", "index": "-n", "output": "-o",

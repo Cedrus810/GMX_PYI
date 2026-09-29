@@ -3,3 +3,6 @@ __pycache__/
 .gmxpy/
 *.xvg
 \#*\#
+.pytest_cache/
+.zcode/
+/gmx_PyI/

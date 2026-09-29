@@ -142,6 +142,27 @@ class System:
 
     minimize = minimise
 
+    def equilibrate(self, workdir=None, protocol=None, run_kwargs=None,
+                    force=False, **protocol_kwargs):
+        """The em -> nvt -> npt chain.  Returns an
+        :class:`~gmxpy.protocol.Equilibration`.
+
+            eq = system.equilibrate(workdir="eq", nvt=100 * u.ps,
+                                    npt=1 * u.ns)
+            eq.production(name="prod").run(ntomp=8)
+        """
+        from .protocol import Equilibration
+
+        self._need_topology("equilibrate")
+        chain = Equilibration(structure=self.structure,
+                              topology=self.topology,
+                              workdir=workdir or self.workdir / "eq",
+                              env=self.env, protocol=protocol,
+                              **protocol_kwargs)
+        chain.run(run_kwargs=run_kwargs, force=force)
+        self.history.append("equilibrate(" + "/".join(chain.stages) + ")")
+        return chain
+
     # -- handover ------------------------------------------------------
     def simulation(self, mdp, name="sim", workdir=None, **kwargs):
         """Hand the prepared system to a :class:`~gmxpy.simulation.Simulation`."""

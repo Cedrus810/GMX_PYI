@@ -74,6 +74,10 @@ class MdpError(GmxpyError):
     pass
 
 
+class HpcError(GmxpyError):
+    pass
+
+
 _FATAL = re.compile(
     r"-{5,}\s*\n\s*(?:Program:.*?\n\s*)?"
     r"(?:Fatal error|Error in user input|Software inconsistency error|Program error)\s*:?\s*\n"

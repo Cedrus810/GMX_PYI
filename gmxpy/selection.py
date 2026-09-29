@@ -432,6 +432,22 @@ class SelectionContext:
                      output=str(cached)).run()
         return cached
 
+    def default_ndx(self):
+        """The default index groups (System, Protein, Water, ...), cached.
+
+        Handing grompp any ``-n`` file hides its built-in defaults, and an
+        mdp saying ``tc-grps = System`` then fails -- so whenever we write
+        an index file, the defaults go in first.
+        """
+        scratch = self.workdir / ".gmxpy"
+        scratch.mkdir(parents=True, exist_ok=True)
+        cached = scratch / (self.structure.stem + "_default.ndx")
+        if not cached.exists():
+            from .command import MakeNdx
+            MakeNdx(env=self._env(), structure=str(self._gro()),
+                    output=str(cached)).run(stdin="q\n")
+        return cached
+
 
 def _last_error(text):
     for marker in ("Invalid selection", "Fatal error", "syntax error"):
